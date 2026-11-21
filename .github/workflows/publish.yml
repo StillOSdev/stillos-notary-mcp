@@ -21,6 +21,12 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      # 2026-11-21: trusted publishing (OIDC) needs npm >= 11.5.1 and setup-node with
+      # node 20 ships npm 10, which silently falls back to token auth and then fails.
+      - name: npm new enough for trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
       - name: Sanity — package loads
         run: node -e "require('./index.cjs'); console.log('index.cjs OK')"
       - name: Publish with provenance
@@ -36,8 +42,21 @@ jobs:
           else
             npm publish --provenance --access public
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # NO NODE_AUTH_TOKEN. 2026-11-21: this package now has an npm Trusted
+        # Publisher connection (GitHub Actions, stillmarcus24/stillos-notary-mcp,
+        # publish.yml), so auth is this run's OIDC identity and the token is not
+        # just unnecessary, it is harmful -- a NODE_AUTH_TOKEN in the environment
+        # takes precedence over OIDC, and that token is the thing that could not
+        # publish.
+        #
+        # WHY THE TOKEN COULD NEVER HAVE WORKED, measured rather than assumed: the
+        # npm account has two-factor set to `auth-and-writes`, so every publish
+        # requires an OTP that no stored credential can supply, and npm answers
+        # E404 on PUT rather than a legible 2FA error. The 2026-09-22 runs
+        # succeeded because a granular token still bypassed 2FA then; npm has
+        # since restricted that, which its own publish-time notice says outright.
+        # An earlier diagnosis in this repo blamed the 30-day token expiry. That
+        # was wrong. Rotating the token would have failed identically.
 
       # ---- Official MCP Registry ------------------------------------------
       # Added 2026-09-22 (stillos-notary-mcp#1, Heaviside479). npm publishing and

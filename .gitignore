@@ -1,3 +1,6 @@
 stillos-notary-mcp.mcpb
 *.tgz
 node_modules/
+.claude-flow/
+.swarm/
+ruvector.db

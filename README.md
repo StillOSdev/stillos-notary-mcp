@@ -2,7 +2,7 @@
 
 Verification infrastructure for the agentic economy. An agent submits a claim;
 the notary returns an Ed25519-signed, hash-chained verdict, settled against
-real external ground truth, not model output. Free tier, no account, no card.
+real external ground truth, not model output. Priced per call via x402; verification of a receipt is free.
 
 Every tool call in this package settles against the live public notary over
 HTTPS (`stillosdigitalholdings.com/notary`). No local or internal-only code path
@@ -33,6 +33,10 @@ ERROR — never a forced guess — signed and hash-chained.
 
 Supported resolver types: `github_pr`, `onchain_tx`, `url_json`, `http_status`,
 `kalshi_market`.
+
+**$0.25 USDC (Base) via x402, billed on the first call - no free tier.** The
+live route reports `free_tier: "none"` and `free_limit_per_day: 0`; a call
+without an attached payment returns the payment requirement, not a verdict.
 
 ```
 stillos-notary-mcp claim "your-agent" "example.com returns 200" \
@@ -103,13 +107,32 @@ anything. No key is received, logged, persisted, or placed in an error message.
 Covered by `test/payment-continuation.test.cjs` (17 cases, local mocks, no real
 settlement).
 
-**Paid: $1.00 USDC (Base) via x402 — no free tier.** A call without an
-attached x402 payment returns the payment requirement (price, `payTo`, asset),
-not a verdict. This package holds no wallet and executes no payment itself;
-the calling agent's own client bears that capability.
+**Served unpaywalled at present.** Measured 2026-11-21 against the live
+service: `POST /notary/dispute` answers without an x402 payment. The server's
+own manifest advertises a $0.25 filing fee, non-refundable either way, and that
+fee is not currently enforced — so this README states what the route does, not
+what the manifest says. If the paywall returns, a call without a payment gets
+the payment requirement (price, `payTo`, asset) and this package attaches the
+payment and retries when the caller has supplied one. This package holds no
+wallet and executes no payment itself; the calling agent's own client bears
+that capability.
+
+A filing requires the `verdict_object` and the `original_resolver_spec` that
+produced the disputed verdict, plus a `reason`. Neither object is recoverable
+from the receipt hash — `GET /notary/verify` returns `claim_sha256`, not the
+verdict — so only the agent that made the original `claim_verdict` call holds
+them, and the server rejects a `verdict_object` that does not hash to the
+receipt. Keep the response you intend to dispute.
+
+Measured 2026-11-21: sending only `{agent, receipt_hash}` — which is what the
+server's own published x402 `input_schema` for this route still advertises —
+gets HTTP 400 `requires {verdict_receipt_hash, verdict_object,
+original_resolver_spec, agent, reason}`. This package sends the fields the
+handler actually reads.
 
 ```
-stillos-notary-mcp dispute "your-agent" <receipt_hash>
+stillos-notary-mcp dispute "your-agent" <receipt_hash> \
+  '{"verdict_object":{...},"original_resolver_spec":{...},"reason":"..."}'
 ```
 
 ### `screen_entity`
@@ -117,7 +140,7 @@ stillos-notary-mcp dispute "your-agent" <receipt_hash>
 OFAC SDN sanctions name screen, with a `source_as_of` freshness timestamp,
 Ed25519-signed.
 
-**Free up to 5/agent/day, then $0.001 USDC (Base) via x402.**
+**$0.001 USDC (Base) via x402, billed on the first call - no free tier.**
 
 ```
 stillos-notary-mcp screen "your-agent" "Acme Corp"
@@ -131,7 +154,7 @@ date-matched controls. ~3% precision at a 2% base rate: a ranking input for
 ordering a review queue, NOT an alarm on a single name. The prior
 "71% sensitivity / 100% specificity" claim (n=14) is withdrawn. Ed25519-signed.
 
-**Free up to 3/agent/day, then $0.15 USDC (Base) via x402.**
+**$0.25 USDC (Base) via x402, billed on the first call - no free tier.**
 
 ```
 stillos-notary-mcp distress "your-agent" AAPL

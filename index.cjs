@@ -50,7 +50,8 @@ const CODES = {
 const SUPPORTED_NETWORKS = new Set(['base', 'eip155:8453']);
 const SUPPORTED_SCHEMES = new Set(['exact']);
 
-// Ceiling per call, in USD. The dearest route here is $1.00 (file_dispute); the
+// Ceiling per call, in USD. The dearest route here is $0.25 (claim_verdict,
+// distress_score); file_dispute is served unpaywalled at present. The
 // default leaves headroom for a price change without silently authorizing more.
 const DEFAULT_MAX_USD = Number(process.env.STILLOS_NOTARY_MAX_USD || 1.50);
 
@@ -180,6 +181,14 @@ async function paidCall(path, body, opts = {}) {
   try {
     const r = await req('POST', path, body);
     if (r.error) return { ok: false, error: r.error };
+    // 2026-11-21: this read `if (r.status !== 402) return { ok: true, ... }`, so every 4xx
+    // and 5xx that is not a payment challenge was reported as a success. Measured live:
+    // file_dispute got HTTP 400 "requires {verdict_receipt_hash, ...}" back as
+    // `{ok: true, status: 400}`. An unpaid caller reading `ok` saw a refusal as a result.
+    // 402 is excluded deliberately: it is the payment challenge, handled below, not a
+    // failure. Returning it here cost 13 of the 17 payment-continuation cases on the
+    // first attempt at this guard.
+    if (r.status >= 400 && r.status !== 402) return { ok: false, status: r.status, ...r.body };
     if (r.status !== 402) return { ok: true, status: r.status, ...r.body };
 
     const desc = paymentDescriptor(r.body);
@@ -189,6 +198,9 @@ async function paidCall(path, body, opts = {}) {
     } catch (e) {
       return { ok: false, payment_required: true, paid: false, code: e.code, error: e.message, payment: desc, ...(e.deps ? { deps: e.deps } : {}) };
     }
+
+    // The free-trial door, under either field name the server has ever used for it.
+    const trialDoor = (r.body && (r.body.need_more_free_calls || r.body.building_on_this)) || null;
 
     if (!payingFetch) {
       return {
@@ -200,18 +212,25 @@ async function paidCall(path, body, opts = {}) {
           ? `payment required ($${desc.amount_usd} ${desc.asset_name || 'USDC'} on ${desc.network})`
           : 'payment required',
         payment: desc,
-        // 2026-09-25: `remediation` used to name ONLY the pay path. The server's 402 has
-        // carried a second, free door since 2026-09-10 -- POST /notary/request-trial, no
-        // wallet and no signup -- and it arrived here inside `...r.body` as
-        // `building_on_this`, where nothing surfaced it. Same defect stillos-kya shipped
-        // for two months: a caller reads `error` and `remediation`, not the raw body, so a
-        // door that is not in those two strings does not exist. Measured there: one real
-        // adopter hit the wall 130 times and /request-trial got zero external submissions.
+        // 2026-09-25: `remediation` used to name ONLY the pay path. The server's 402 also
+        // carries a second, free door -- POST /notary/request-trial, no wallet and no
+        // signup -- and it arrived here inside `...r.body`, where nothing surfaced it. A
+        // caller reads `error` and `remediation`, not the raw body, so a door that is not
+        // in those two strings does not exist. Same defect stillos-kya shipped for two
+        // months: one real adopter hit the wall 130 times, /request-trial got zero
+        // external submissions.
+        // 2026-11-21: THE KEY NAME WAS WRONG AND THIS WAS DEAD CODE. Measured against the
+        // live server: POST /notary/claim-verdict 402 carries the door as
+        // `need_more_free_calls`; `building_on_this` appears on no notary 402 at all, and
+        // /notary/screen-entity's 402 carries neither (it has `how_to_fix` only). The
+        // only test covering this fed a mock emitting `building_on_this`, i.e. it verified
+        // the code against its own invented field. Both names are read now, live one
+        // first, and nothing is invented when the server offers no door.
         remediation: 'Pass a payment-capable fetch as opts.fetch, a viem account as opts.account, or set STILLOS_NOTARY_WALLET_KEY, then call again — this package will attach the x402 payment and retry automatically.'
-          + ((r.body && r.body.building_on_this && r.body.building_on_this.path)
-            ? ` Not ready to pay? ${r.body.building_on_this.path} with {"agent":"<same id>","contact":"<email>"} — no payment, no signup, a founder reads every one and grants extended free tiers to real integrators.`
+          + (trialDoor && trialDoor.path
+            ? ` Not ready to pay? ${trialDoor.path} with {"agent":"<same id>","contact":"<email>"} — no payment, no signup, a founder reads every one and grants extended free tiers to real integrators.`
             : ''),
-        ...(r.body && r.body.building_on_this ? { request_trial: r.body.building_on_this } : {}),
+        ...(trialDoor ? { request_trial: trialDoor } : {}),
         contact: 'stillmarcus24@gmail.com',
         ...r.body,
       };
@@ -250,7 +269,7 @@ function req(method, path, body) {
 const TOOLS = [
   {
     name: 'claim_verdict',
-    description: 'Submits a claim and returns a signed verdict: settled against real external ground truth (GitHub PR, on-chain tx, HTTP status, JSON field, Kalshi market, or multi-exchange price consensus), Ed25519-signed, hash-chained. Free tier — no account, no card. Returns CONFIRMED, REFUTED, or ERROR — never a forced guess.',
+    description: 'Submits a claim and returns a signed verdict: settled against real external ground truth (GitHub PR, on-chain tx, HTTP status, JSON field, Kalshi market, or multi-exchange price consensus), Ed25519-signed, hash-chained. $0.25 USDC (Base) via x402, billed on the first call — no free tier. Returns CONFIRMED, REFUTED, or ERROR — never a forced guess.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -279,19 +298,30 @@ const TOOLS = [
   },
   {
     name: 'file_dispute',
-    description: 'Files a bonded dispute against a verdict receipt: the disputed verdict is re-resolved immediately against the identical resolver specification that produced it — independent re-run, not a re-vote. An upheld dispute overturns the verdict and queues a slashable payout against the notary\'s on-chain correctness bond. Paid: $1.00 USDC (Base) via x402 — no free tier. A call without an attached x402 payment returns the payment requirement (price, payTo, asset), not a verdict.',
+    description: 'Files a bonded dispute against a verdict receipt: the disputed verdict is re-resolved immediately against the identical resolver specification that produced it — independent re-run, not a re-vote. An upheld dispute overturns the verdict and queues a slashable payout against the notary\'s on-chain correctness bond. Price: served unpaywalled at present — measured 2026-11-21, POST /notary/dispute answers without an x402 payment. The server manifest advertises a $0.25 filing fee and it is not currently enforced; if the paywall returns, this tool attaches the payment and retries.',
     inputSchema: {
       type: 'object',
       properties: {
+        // 2026-11-21: the live handler rejects {agent, receipt_hash} with HTTP 400
+        // "requires {verdict_receipt_hash, verdict_object, original_resolver_spec, agent,
+        // reason}". The server's own published x402 input_schema for /notary/dispute still
+        // names only [agent, receipt_hash], so this tool was unfileable by construction
+        // while matching the advertised contract. These are the fields the handler reads.
+        // verdict_object and original_resolver_spec are NOT recoverable from
+        // GET /notary/verify (it returns claim_sha256, not the verdict or the resolver), so
+        // only the agent that made the original claim_verdict call holds them. Keep them.
         agent: { type: 'string', description: 'who is filing the dispute (shown on the public reputation ledger)' },
         receipt_hash: { type: 'string', description: 'the receipt_hash of the verdict being disputed — must be under 48 hours old' },
+        verdict_object: { type: 'object', description: 'the full verdict body as returned by claim_verdict for this receipt' },
+        original_resolver_spec: { type: 'object', description: 'the resolver spec that produced the disputed verdict — the dispute re-runs exactly this' },
+        reason: { type: 'string', description: 'why the verdict is wrong against its own cited source' },
       },
-      required: ['agent', 'receipt_hash'],
+      required: ['agent', 'receipt_hash', 'verdict_object', 'original_resolver_spec', 'reason'],
     },
   },
   {
     name: 'screen_entity',
-    description: 'OFAC SDN sanctions name screen: matches a legal name against the OFAC Specially Designated Nationals list, with a source_as_of freshness timestamp, Ed25519-signed. Free up to 5/agent/day, then $0.001 USDC (Base) via x402. Once the free tier is used up, a call without an attached x402 payment returns the payment requirement, not a verdict.',
+    description: 'OFAC SDN sanctions name screen: matches a legal name against the OFAC Specially Designated Nationals list, with a source_as_of freshness timestamp, Ed25519-signed. $0.001 USDC (Base) via x402, billed on the first call — no free tier. A call without an attached x402 payment returns the full payment requirement (accepts[] with network, asset, payTo, amount), not a verdict.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -303,7 +333,7 @@ const TOOLS = [
   },
   {
     name: 'distress_score',
-    description: 'Balance-sheet corporate distress ranker for a single equity ticker: Altman Z-score computed from live SEC XBRL filings, held-out AUC 0.769 (178 real Chapter 11 filings vs 71 date-matched controls), Ed25519-signed. Free up to 3/agent/day, then $0.15 USDC (Base) via x402. Once the free tier is used up, a call without an attached x402 payment returns the payment requirement, not a verdict.',
+    description: 'Balance-sheet corporate distress ranker for a single equity ticker: Altman Z-score computed from live SEC XBRL filings, held-out AUC 0.769 (178 real Chapter 11 filings vs 71 date-matched controls), Ed25519-signed. $0.25 USDC (Base) via x402, billed on the first call — no free tier. A call without an attached x402 payment returns the full payment requirement (accepts[] with network, asset, payTo, amount), not a verdict.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -319,9 +349,13 @@ async function callTool(name, args, opts = {}) {
   if (name === 'claim_verdict') {
     const { agent, claim, resolver } = args;
     if (!agent || !claim || !resolver || !resolver.type) throw new Error('agent, claim, and resolver.type are required');
-    const r = await req('POST', '/claim-verdict', { agent, claim, resolver });
-    if (r.error) return { ok: false, error: r.error };
-    return { ok: true, status: r.status, ...r.body };
+    // 2026-11-21: this used plain req(), from the era when claim-verdict had a free tier.
+    // The live route is $0.25 with free_tier "none" (free_limit_per_day 0), so an unpaid
+    // call 402s -- and req() sets r.error only on a transport failure, so the 402 body was
+    // spread into an `ok: true` response with no verdict in it. The package's headline tool
+    // both could not pay and reported its own refusal as a success. paidCall() attaches the
+    // payment when the caller has one and otherwise returns an explicit payment_required.
+    return paidCall('/claim-verdict', { agent, claim, resolver }, opts);
   }
   if (name === 'verify_receipt') {
     const { hash } = args;
@@ -331,9 +365,21 @@ async function callTool(name, args, opts = {}) {
     return { ok: true, status: r.status, ...r.body };
   }
   if (name === 'file_dispute') {
-    const { agent, receipt_hash } = args;
+    const { agent, receipt_hash, verdict_object, original_resolver_spec, reason } = args;
     if (!agent || !receipt_hash) throw new Error('agent and receipt_hash are required');
-    return paidCall('/dispute', { agent, receipt_hash }, opts);
+    if (!verdict_object || !original_resolver_spec || !reason) {
+      throw new Error('verdict_object, original_resolver_spec and reason are required — the live /notary/dispute handler rejects a filing without them, and they are not recoverable from a receipt hash alone (GET /notary/verify returns claim_sha256, not the verdict). Keep the claim_verdict response you are disputing.');
+    }
+    // `verdict_receipt_hash` is the field name the handler reads; `receipt_hash` is kept
+    // alongside it because the server's published input_schema still advertises that name.
+    return paidCall('/dispute', {
+      agent,
+      receipt_hash,
+      verdict_receipt_hash: receipt_hash,
+      verdict_object,
+      original_resolver_spec,
+      reason,
+    }, opts);
   }
   if (name === 'screen_entity') {
     const { agent, entity } = args;

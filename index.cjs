@@ -150,8 +150,11 @@ function resolvePayingFetch(opts) {
 // risk paying twice for nothing, so it is a hard stop, not a backoff loop.
 async function payAndRetry(path, body, payingFetch) {
   let res;
+  // Same guard as req(): never sign and send a payment at a concatenated-wrong URL.
+  const built = notaryUrl(path);
+  if (built.error) throw payErr(CODES.PAYMENT_CONSTRUCTION_FAILED, built.error);
   try {
-    res = await payingFetch(NOTARY + path, {
+    res = await payingFetch(built.url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
       body: JSON.stringify(body),
@@ -248,9 +251,32 @@ async function paidCall(path, body, opts = {}) {
   }
 }
 
+// 2026-11-23: `NOTARY + path` silently produced a REACHABLE-but-wrong URL whenever
+// `path` arrived without a leading slash or as a non-string. NOTARY has its trailing
+// slash stripped, so "/notary" + "test" is "/notarytest" -- and `new URL()` accepts
+// that happily, which is why the try/catch below never caught it. Measured live in
+// state/agent-visitor-log.jsonl: 37 calls from 3 external IPs landed on
+// /notary[object%20Object], /notarytest, /notaryundefined, /notarynull, /notary400,
+// /notary402, /notarydata, /notarymessage, /notaryevent and /notaryscs-guided. Every
+// one 404'd before reaching a metered route, so an integrator who ran this package got
+// nothing and our paywall ledger correctly recorded no request at all. Build the URL
+// through one guard instead of concatenating at each call site.
+function notaryUrl(path) {
+  if (typeof path !== 'string' || path === '') {
+    return { error: `bad notary path: expected a string starting with "/", got ${path === '' ? 'empty string' : typeof path}` };
+  }
+  if (path[0] !== '/') {
+    return { error: `bad notary path: ${JSON.stringify(path.slice(0, 60))} must start with "/"` };
+  }
+  let u; try { u = new URL(NOTARY + path); } catch { return { error: 'bad notary URL' }; }
+  return { url: u };
+}
+
 function req(method, path, body) {
   return new Promise((resolve) => {
-    let u; try { u = new URL(NOTARY + path); } catch { return resolve({ error: 'bad notary URL' }); }
+    const built = notaryUrl(path);
+    if (built.error) return resolve({ error: built.error });
+    const u = built.url;
     const lib = u.protocol === 'http:' ? http : https;
     const data = body ? JSON.stringify(body) : null;
     const headers = { accept: 'application/json', 'user-agent': UA };

@@ -209,4 +209,6 @@ Something wrong in your dossier? Correct it, free, no account:
 
 [https://stillosdigitalholdings.com/surface/correct](https://stillosdigitalholdings.com/surface/correct?src=gh-stillos-notary-mcp)
 
+What we sell, priced: [https://stillosdigitalholdings.com/f](https://stillosdigitalholdings.com/f?src=gh-stillos-notary-mcp)
+
 <!-- stillos-capture:end -->
